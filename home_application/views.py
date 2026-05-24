@@ -6,6 +6,7 @@ import time
 from django.conf import settings
 from django.http import JsonResponse
 from django.shortcuts import render
+from django.utils import timezone
 
 from blueapps.account.decorators import login_exempt
 from blueking.component.shortcuts import get_client_by_request, get_client_by_user
@@ -187,6 +188,52 @@ def _job_result_link(job_instance_id):
         JOB_BK_BIZ_ID,
         job_instance_id,
     )
+
+
+def _normalize_backup_rows(log_data, bk_host_id, search_path, suffix, backup_path):
+    """Build DB rows from JOB logs, falling back to request data on custom scripts."""
+    if isinstance(log_data, list):
+        source_rows = [row for row in log_data if isinstance(row, dict)]
+    elif isinstance(log_data, dict):
+        source_rows = [log_data]
+    else:
+        source_rows = []
+
+    backup_rows = []
+    backup_time = timezone.now().strftime("%Y-%m-%d %H:%M:%S")
+    for row in source_rows:
+        if row.get("message"):
+            continue
+
+        file_list = row.get("bk_file_list") or row.get("file_list") or []
+        if isinstance(file_list, str):
+            file_list = [item.strip() for item in file_list.split(",") if item.strip()]
+
+        backup_name = row.get("bk_backup_name") or row.get("backup_name")
+        if not backup_name and file_list:
+            backup_name = ",".join([
+                "{}/{}".format(backup_path.rstrip("/"), item.split("/")[-1])
+                for item in file_list
+            ])
+
+        backup_rows.append({
+            "bk_host_id": row.get("bk_host_id") or bk_host_id,
+            "bk_file_dir": row.get("bk_file_dir") or search_path,
+            "bk_file_suffix": row.get("bk_file_suffix") or suffix,
+            "bk_backup_name": backup_name or backup_path,
+            "bk_file_create_time": row.get("bk_file_create_time") or row.get("backup_time") or backup_time,
+        })
+
+    if not backup_rows:
+        backup_rows.append({
+            "bk_host_id": bk_host_id,
+            "bk_file_dir": search_path,
+            "bk_file_suffix": suffix,
+            "bk_backup_name": backup_path,
+            "bk_file_create_time": backup_time,
+        })
+
+    return backup_rows
 
 
 @api_login_exempt
@@ -422,22 +469,13 @@ def backup_file(request):
     created_records = []
     for bk_host_id in host_id_list:
         log_data = _load_job_log(client, job_instance_id, step_instance_id, bk_host_id)
-        if isinstance(log_data, dict):
-            log_rows = [log_data]
-        elif isinstance(log_data, list):
-            log_rows = log_data
-        else:
-            log_rows = []
-
-        for row in log_rows:
-            if not isinstance(row, dict):
-                continue
+        for row in _normalize_backup_rows(log_data, bk_host_id, search_path, suffix, backup_path):
             record = BackupRecord.objects.create(
-                bk_host_id=bk_host_id,
-                bk_file_dir=search_path,
-                bk_file_suffix=suffix,
-                bk_backup_name=row.get("bk_backup_name", ""),
-                bk_file_create_time=row.get("bk_file_create_time", ""),
+                bk_host_id=row["bk_host_id"],
+                bk_file_dir=row["bk_file_dir"],
+                bk_file_suffix=row["bk_file_suffix"],
+                bk_backup_name=row["bk_backup_name"],
+                bk_file_create_time=row["bk_file_create_time"],
                 bk_file_operator=username,
                 bk_job_link=job_link,
             )
